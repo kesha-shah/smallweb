@@ -33,6 +33,9 @@ opml_cache = None          # will hold generated OPML xml
 # Used to build the list in the template, and perform validation on the server.
 favorite_emoji_list = ["👍","😍","😀","😘","😆","😜","🫶","😂","😱","🤔","👏","🚀","🥳","🔥"]
 
+# Maximum number of visited URLs to track in browser localStorage for favorites feed
+MAX_VISITED_URLS = 50  # Can be changed to 100 or any other value
+
 def generate_appreciated_feed():
     """Generate Atom feed for appreciated posts"""
     global appreciated_feed
@@ -415,6 +418,7 @@ def index():
         favorites_total=favorites_total,
         favorite_emoji_list=favorite_emoji_list,
         reactions_dict=reactions_dict,
+        max_visited_urls=MAX_VISITED_URLS,  # Pass constant to template
     )
 
 
@@ -556,6 +560,8 @@ def opml():
     if opml_cache is None:          # first call before update_all ran?
         opml_cache = generate_opml_feed()
     return Response(opml_cache, mimetype="text/x-opml+xml")
+
+
 
 
 

@@ -368,7 +368,429 @@ href="https://github.com/kagisearch/smallweb">open-source</a>.</p>
 })();
 </script>
 
+{# URL Tracking for Favorites Feed #}
+<script>
+(function() {
+  'use strict';
+  try {
+    const STORAGE_KEY = 'smallweb_visited_urls';
+    const MAX_VISITED = {{ max_visited_urls|default(50) }};
+    const CURRENT_MODE = {{ current_mode|default(0) }};
 
+  // Initialize tracker object early so it's always available
+  window.smallwebUrlTracker = {
+    isActive: false,
+    getVisitedUrls: function() { return []; },
+    normalizeUrl: function(url) { return url; },
+    urlsMatch: function() { return false; },
+    clearVisitedUrls: function() { 
+      localStorage.removeItem('smallweb_visited_urls');
+    },
+    clearAll: function() {
+      localStorage.removeItem('smallweb_visited_urls');
+      localStorage.removeItem('smallweb_url_tracking');
+      console.log('✅ Cleared all data (visited URLs + tracking)');
+      return true;
+    },
+    reset: function() {
+      localStorage.removeItem('smallweb_visited_urls');
+      localStorage.removeItem('smallweb_url_tracking');
+      console.log('✅ Cleared all data, reloading page...');
+      window.location.reload();
+    },
+    getCount: function() { return 0; }
+  };
+
+  // Only run for favorites feed (current_mode == 2)
+  if (CURRENT_MODE !== 2) {
+    return;
+  }
+
+  /**
+   * Normalize URL for comparison using native URL API
+   * Handles: http/https, www, trailing slashes, query params, fragments
+   */
+  function normalizeUrl(urlString) {
+    try {
+      // Handle relative URLs or malformed URLs
+      if (!urlString || !urlString.startsWith('http')) {
+        return urlString;
+      }
+
+      const url = new URL(urlString);
+      
+      // Normalize scheme to https
+      url.protocol = 'https:';
+      
+      // Remove www. prefix
+      if (url.hostname.startsWith('www.')) {
+        url.hostname = url.hostname.substring(4);
+      }
+      
+      // Remove trailing slash from pathname (except root)
+      if (url.pathname.length > 1 && url.pathname.endsWith('/')) {
+        url.pathname = url.pathname.slice(0, -1);
+      }
+      
+      // Sort query parameters for consistent comparison
+      const params = new URLSearchParams(url.search);
+      const sortedParams = Array.from(params.entries())
+        .sort((a, b) => a[0].localeCompare(b[0]));
+      url.search = new URLSearchParams(sortedParams).toString();
+      
+      // Remove fragment
+      url.hash = '';
+      
+      return url.toString();
+    } catch (e) {
+      console.warn('URL normalization failed for:', urlString, e);
+      return urlString;
+    }
+  }
+
+  /**
+   * Check if two URLs are the same after normalization
+   */
+  function urlsMatch(url1, url2) {
+    if (!url1 || !url2) return false;
+    return normalizeUrl(url1) === normalizeUrl(url2);
+  }
+
+  /**
+   * Load visited URLs from localStorage
+   */
+  function loadVisitedUrls() {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      return stored ? JSON.parse(stored) : [];
+    } catch (e) {
+      console.warn('Failed to load visited URLs:', e);
+      return [];
+    }
+  }
+
+  /**
+   * Save visited URLs to localStorage (FIFO queue)
+   */
+  function saveVisitedUrl(url) {
+    try {
+      let visited = loadVisitedUrls();
+      const normalized = normalizeUrl(url);
+      
+      // Remove if already exists (to move to end)
+      visited = visited.filter(u => normalizeUrl(u) !== normalized);
+      
+      // Add to end
+      visited.push(url);
+      
+      // Remove oldest if over limit (FIFO)
+      if (visited.length > MAX_VISITED) {
+        visited.shift();
+      }
+      
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(visited));
+      return visited;
+    } catch (e) {
+      console.warn('Failed to save visited URL:', e);
+      return [];
+    }
+  }
+
+  /**
+   * Check if URL is already visited
+   */
+  function isUrlVisited(url) {
+    const visited = loadVisitedUrls();
+    return visited.some(visitedUrl => urlsMatch(visitedUrl, url));
+  }
+
+  const currentUrl = "{{ url|safe }}";
+  const nextUrl = "{{ next_doc_url|safe }}" || null;
+
+  /**
+   * Get tracking data from localStorage
+   */
+  function loadTracking() {
+    try {
+      const stored = localStorage.getItem('smallweb_url_tracking');
+      return stored ? JSON.parse(stored) : { repeated_urls: [], new_urls: [] };
+    } catch (e) {
+      console.warn('Failed to load tracking:', e);
+      return { repeated_urls: [], new_urls: [] };
+    }
+  }
+
+  /**
+   * Save tracking data to localStorage
+   */
+  function saveTracking(tracking) {
+    try {
+      localStorage.setItem('smallweb_url_tracking', JSON.stringify(tracking));
+    } catch (e) {
+      console.warn('Failed to save tracking:', e);
+    }
+  }
+
+
+  /**
+   * Fetch a new URL from server in the background (without page refresh)
+   * Returns a promise that resolves with the URL or null if failed
+   */
+  async function fetchNewUrlFromServer(maxAttempts = 1) {
+    const prefix = "{{ prefix }}";
+    const visited = loadVisitedUrls();
+    const normalizedVisited = new Set(visited.map(url => normalizeUrl(url)));
+    
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        // Fetch a random URL from favorites feed
+        const response = await fetch(prefix + '?app', {
+          method: 'GET',
+          headers: { 'Accept': 'text/html' }
+        });
+        
+        if (!response.ok) {
+          console.log('   Fetch failed with status:', response.status);
+          continue; // Try again
+        }
+        
+        const html = await response.text();
+        
+        // Parse HTML to extract URL from iframe src
+        // Look for: <iframe src="https://example.com/...">
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        const iframe = doc.querySelector('#content iframe, iframe[src^="http"]');
+        
+        let fetchedUrl = null;
+        if (iframe && iframe.src) {
+          fetchedUrl = iframe.src;
+        } else {
+          // Fallback: try regex to find iframe src
+          const urlMatch = html.match(/<iframe[^>]*src="([^"]+)"/);
+          if (urlMatch && urlMatch[1]) {
+            fetchedUrl = urlMatch[1];
+          }
+        }
+        
+        if (fetchedUrl && fetchedUrl.startsWith('http')) {
+          console.log('   Fetched URL:', fetchedUrl);
+          // Check if this URL is visited
+          const normalizedFetched = normalizeUrl(fetchedUrl);
+          const isFetchedVisited = normalizedVisited.has(normalizedFetched);
+          console.log('   Fetched URL is visited?', isFetchedVisited);
+          
+          if (!isFetchedVisited) {
+            return fetchedUrl;
+          }
+        } else {
+          console.log('   Could not extract URL from response');
+        }
+      } catch (error) {
+        console.log('   Fetch error:', error.message);
+        continue;
+      }
+    }
+    
+    return null; // Failed to find new URL after max attempts
+  }
+
+  /**
+   * Update the next link in the background if it's visited
+   */
+  async function updateNextLinkIfNeeded() {
+    const nextUrl = "{{ next_doc_url|safe }}" || null;
+    
+    console.log('🔍 Checking next URL:', nextUrl);
+    
+    if (!nextUrl || !nextUrl.startsWith('http')) {
+      console.log('   No next URL to check');
+      return; // No next URL to check
+    }
+    
+    const isNextVisited = isUrlVisited(nextUrl);
+    console.log('   Next URL is visited?', isNextVisited);
+    
+    if (!isNextVisited) {
+      console.log('✅ Next URL is new - no update needed');
+      return; // Next URL is not visited, no need to update
+    }
+    
+    // Next URL is visited, track it and fetch a new one in the background
+    console.log('🔄 Next URL is visited - tracking and fetching new URL in background...');
+    
+    // Track the repeated next URL
+    let tracking = loadTracking();
+    console.log('   Current tracking state:', tracking);
+    
+    if (!tracking.repeated_urls) {
+      tracking.repeated_urls = [];
+    }
+    
+    tracking.repeated_urls.push({
+      url: nextUrl,
+      timestamp: new Date().toISOString()
+    });
+    
+    saveTracking(tracking);
+    console.log('📝 Added next URL to repeated URLs list:', nextUrl);
+    console.log('   Updated repeated URLs count:', tracking.repeated_urls.length);
+    
+    let attempt = 0;
+    let newUrl = null;
+    
+    while (!newUrl && attempt < 10) {
+      attempt++;
+      console.log(`   Attempt ${attempt}/10: Fetching new URL...`);
+      newUrl = await fetchNewUrlFromServer(1); // Fetch one at a time to log each attempt
+      
+      if (newUrl) {
+        console.log('✅ Found new URL:', newUrl);
+        
+        // Track the new URL that was fetched
+        tracking = loadTracking(); // Reload to get latest state
+        if (!tracking.new_urls) {
+          tracking.new_urls = [];
+        }
+        tracking.new_urls.push({
+          url: newUrl,
+          timestamp: new Date().toISOString()
+        });
+        saveTracking(tracking);
+        console.log('📝 Added new URL to tracking list:', newUrl);
+        console.log('   Updated new URLs count:', tracking.new_urls.length);
+      } else {
+        console.log('   URL was visited, trying again...');
+      }
+    }
+    
+    if (newUrl) {
+      // Update the next link
+      const prefix = "{{ prefix }}";
+      const newNextLink = prefix + '?app=&url=' + encodeURIComponent(newUrl);
+      const nextLinkElement = document.querySelector('.stumble-link');
+      
+      console.log('🔗 Updating next link to:', newNextLink);
+      
+      if (nextLinkElement) {
+        nextLinkElement.href = newNextLink;
+        // Also update prefetch links in head
+        const prefetchLinks = document.querySelectorAll('link[rel="prefetch"], link[rel="prerender"]');
+        prefetchLinks.forEach(link => {
+          if (link.href.includes('?app')) {
+            link.href = newNextLink;
+          }
+        });
+        console.log('✅ Next link updated successfully');
+      } else {
+        console.warn('⚠️ Could not find next link element to update');
+      }
+    } else {
+      console.warn('⚠️ Could not find a new URL after 10 attempts');
+    }
+  }
+
+  // Check current URL - just track it, never redirect
+  console.log('🔍 Checking current URL:', currentUrl);
+  
+  if (currentUrl && currentUrl.startsWith('http')) {
+    const isVisited = isUrlVisited(currentUrl);
+    console.log('   Is visited?', isVisited);
+    
+    if (!isVisited) {
+      // New URL, add to visited list
+      console.log('✅ New URL - adding to visited list');
+      saveVisitedUrl(currentUrl);
+    } else {
+      console.log('ℹ️ Current URL is already visited - staying on page (no redirect)');
+    }
+  }
+
+  // Check and update next URL in background (non-blocking)
+  updateNextLinkIfNeeded();
+
+
+  // Expose utility functions to window for console access
+  window.smallwebUrlTracker = {
+    // Get all visited URLs
+    getVisitedUrls: loadVisitedUrls,
+    
+    // Get tracking data (repeated and new URLs)
+    getTracking: loadTracking,
+    
+    // Get only repeated URLs
+    getRepeatedUrls: () => {
+      const tracking = loadTracking();
+      return tracking.repeated_urls || [];
+    },
+    
+    // Get only new URLs that were fetched
+    getNewUrls: () => {
+      const tracking = loadTracking();
+      return tracking.new_urls || [];
+    },
+    
+    // URL utilities
+    normalizeUrl: normalizeUrl,
+    urlsMatch: urlsMatch,
+    
+    // Get count of visited URLs
+    getCount: () => loadVisitedUrls().length,
+    
+    // Clear all data
+    clearAll: () => {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem('smallweb_url_tracking');
+      console.log('✅ Cleared all data (visited URLs + tracking)');
+      return true;
+    },
+    
+    // Clear only visited URLs (keep tracking)
+    clearVisitedUrls: () => {
+      localStorage.removeItem(STORAGE_KEY);
+      console.log('✅ Cleared visited URLs (tracking kept)');
+      return true;
+    },
+    
+    // Clear only tracking (keep visited URLs)
+    clearTracking: () => {
+      localStorage.removeItem('smallweb_url_tracking');
+      console.log('✅ Cleared tracking data (visited URLs kept)');
+      return true;
+    },
+    
+    // Reset everything - clear all and reload page
+    reset: () => {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem('smallweb_url_tracking');
+      console.log('✅ Cleared all data, reloading page...');
+      window.location.reload();
+    },
+    
+    // Get localStorage size estimate
+    getStorageSize: () => {
+      const visited = localStorage.getItem(STORAGE_KEY) || '';
+      const tracking = localStorage.getItem('smallweb_url_tracking') || '';
+      const totalBytes = new Blob([visited, tracking]).size;
+      return {
+        visitedBytes: new Blob([visited]).size,
+        trackingBytes: new Blob([tracking]).size,
+        totalBytes: totalBytes,
+        totalKB: (totalBytes / 1024).toFixed(2),
+        visitedCount: loadVisitedUrls().length
+      };
+    }
+  };
+
+  } catch (error) {
+    console.error('Error initializing URL Tracker:', error);
+    window.smallwebUrlTracker = {
+      error: 'Failed to initialize',
+      getVisitedUrls: function() { return []; }
+    };
+  }
+})();
+</script>
 
 </body>
 </html>
